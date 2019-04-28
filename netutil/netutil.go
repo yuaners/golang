@@ -4,210 +4,141 @@ import (
 	"net"
 	"time"
 	"errors"
-	"bytes"
-	"encoding/binary"
 	"io"
-	)
-
-const MinRead = 512
+)
 
 const bufferSize = 1024 * 1024
 
-var (
-	ErrInvalidConn = errors.New("net util: invalid conn")
-
-	ErrUnexpectedLength = errors.New("net util: unexpected length")
-)
-
-type gramConn struct {
-	conn   net.Conn
-	head   header
-	len    int
-	rBuf   []byte
-	wBuf   []byte
-	hBuf   []byte
+type Header interface {
+	// Calculated data on the head
+	Calc(data []byte) error
+	// Header length
+	Len() uint64
+	// Encode header too writer
+	Encode(writer io.Writer) error
+	// Decode header from reader
+	Decode(reader io.Reader) error
 }
 
-func (c *gramConn) readFull(b []byte) error {
-	return readFull(c.conn, b)
+type packConn struct {
+	// The original connection
+	conn net.Conn
+	// The DataGram head
+	rHead Header
+	wHead Header
+
+	// read/write buffer
+	rBuf []byte
+	wBuf []byte
 }
 
-func (c *gramConn) readHeader() error {
-	var length = 0
-	var n int
-	var err error
+func (c *packConn) Read(b []byte) (n int, err error) {
+	if c.rHead == nil {
+		return c.conn.Read(b)
+	}
+
+	if err = c.rHead.Decode(c.conn); err != nil {
+		return 0, err
+	}
+
+	if c.rHead.Len() == 0 {
+		return 0, nil
+	}
+
+	if c.rHead.Len() > uint64(len(c.rBuf)) {
+		defer func() {
+			if recover() != nil {
+				err = errors.New("make slice too large")
+			}
+		}()
+		c.rBuf = make([]byte, c.rHead.Len() * 2)
+	}
+
+	var length uint64 = 0
 	for {
-		if n,err = c.conn.Read(c.hBuf[length:]); err != nil {
-			return err
+		n,err = c.conn.Read(c.rBuf[length:length + c.rHead.Len()])
+		if err != nil {
+			return
 		}
-		length += n
-		if length >= len(c.hBuf) {
+		length += uint64(n)
+		if length >= c.rHead.Len() {
 			break
 		}
 	}
+	n = copy(b, c.rBuf[:length])
 
-	return nil
+	return n, nil
 }
 
-func (c *gramConn) Read(b []byte) (n int, err error) {
-	if c.head.Length == 0 {
-		var length = 0
-		for {
-			if n,err = c.conn.Read(c.hBuf[length:]); err != nil {
-				return
-			}
-			length += n
-			if length >= len(c.hBuf) {
-				break
-			}
-		}
-		if err = c.head.decode(bytes.NewReader(c.hBuf)); err != nil {
-			return
-		}
-		if err = c.head.verify(); err != nil {
-			if err != ErrInvalidMagic {
-				return
-			}
-			RESET:
-			if err == ErrInvalidMagic {
-				var buf = make([]byte, 0, 4 * 4096)
-				buf = append(buf, c.hBuf...)
-				for {
-					if err = c.readHeader(); err != nil {
-						return
-					}
-					buf = append(buf, c.hBuf...)
-					var index = -1
-					var w = bytes.NewBuffer(nil)
-					if err = binary.Write(w, binary.BigEndian, uint64(protocolMagic)); err != nil {
-						return
-					}
-					if index = bytes.Index(buf, w.Bytes()); index != -1 {
-						if len(buf) - index < headerSize() {
-							var diff = headerSize() - len(buf) + index
-							var diffBuf = make([]byte, diff)
-							if err = readFull(c.conn, diffBuf); err != nil {
-								return
-							}
-							buf = append(buf, diffBuf...)
-						}
-						if err = c.head.decode(bytes.NewReader(buf[index:index + headerSize()])); err != nil {
-							return
-						}
-						if err = c.head.verify(); err != nil {
-							goto RESET
-						}
-						break
-					}
-				}
-			}
-		}
+func (c *packConn) Write(b []byte) (n int, err error) {
+	if c.wHead == nil {
+		return c.conn.Write(b)
 	}
-	if c.head.Length > 0 {
-		if c.head.Length > uint64(len(c.rBuf)) {
-			c.rBuf = make([]byte, c.head.Length * 2)
-		}
-		var length uint64 = 0
-		for {
-			n,err = c.conn.Read(c.rBuf[length:c.head.Length + length])
-			if err != nil {
-				return
-			}
-			length += uint64(n)
-			if length >= c.head.Length {
-				break
-			}
-		}
-		n = copy(b, c.rBuf[:length])
-		c.head.Length = 0
+
+	if err = c.wHead.Calc(b); err != nil {
+		return 0, err
+	}
+
+	if err = c.wHead.Encode(c.conn); err != nil {
+		return 0, err
+	}
+
+	if n,err = c.conn.Write(b); err != nil {
+		return 0, err
 	}
 
 	return
 }
 
-func (c *gramConn) Write(b []byte) (n int, err error) {
-	var h = newHeader()
-	if err = h.calc(b); err != nil {
-		return
-	}
-	if err = h.verify(); err != nil {
-		return
-	}
-	var buf = bytes.NewBuffer(c.wBuf)
-	buf.Reset()
-	if err = h.encode(buf); err != nil {
-		return
-	}
-	if n,err = buf.Write(b); err != nil {
-		return
-	}
-
-	n,err = c.conn.Write(buf.Bytes())
-	if n >= headerSize() {
-		n -= headerSize()
-	}
-
-	return
-}
-
-func (c *gramConn) Close() error {
+func (c *packConn) Close() error {
 	return c.conn.Close()
 }
 
-func (c *gramConn) LocalAddr() net.Addr {
+func (c *packConn) LocalAddr() net.Addr {
 	return c.conn.LocalAddr()
 }
 
-func (c *gramConn) RemoteAddr() net.Addr {
+func (c *packConn) RemoteAddr() net.Addr {
 	return c.conn.RemoteAddr()
 }
 
-func (c *gramConn) SetDeadline(t time.Time) error {
+func (c *packConn) SetDeadline(t time.Time) error {
 	return c.conn.SetDeadline(t)
 }
 
-func (c *gramConn) SetReadDeadline(t time.Time) error {
+func (c *packConn) SetReadDeadline(t time.Time) error {
 	return c.conn.SetReadDeadline(t)
 }
 
-func (c *gramConn) SetWriteDeadline(t time.Time) error {
+func (c *packConn) SetWriteDeadline(t time.Time) error {
 	return c.conn.SetWriteDeadline(t)
 }
 
-func updateConn(conn net.Conn, buf []byte) net.Conn {
-	if _,ok := conn.(*gramConn); ok {
+func updateConn(conn net.Conn, r, w Header, rBuf, wBuf []byte) net.Conn {
+	if _,ok := conn.(*packConn); ok {
 		return conn
 	}
 
-	if buf == nil || len(buf) == 0 {
-		buf = make([]byte, bufferSize)
+	if rBuf == nil || len(rBuf) == 0 {
+		rBuf = make([]byte, bufferSize)
+	}
+	if wBuf == nil || len(wBuf) == 0 {
+		wBuf = make([]byte, bufferSize)
 	}
 
-	var c = new(gramConn)
+	var c = new(packConn)
 
 	c.conn = conn
-	c.rBuf = buf
-	c.wBuf = make([]byte, bufferSize)
-	c.len = 0
-	c.hBuf = make([]byte, headerSize())
+	c.rBuf = rBuf
+	c.wBuf = wBuf
+	c.rHead = r
+	c.wHead = w
 
 	return c
 }
 
-func readGram(conn net.Conn, capacity int64) (b []byte, err error) {
-	if _,ok := conn.(*gramConn); !ok {
-		return nil, ErrInvalidConn
-	}
-
-	return
-}
-
 func UpdateConn(conn net.Conn) net.Conn {
-	return updateConn(conn, make([]byte, bufferSize))
-}
-
-func ReadGram(conn net.Conn) ([]byte, error) {
-	return readGram(conn, MinRead)
+	return updateConn(conn, newHeader(), newHeader(), make([]byte, bufferSize), make([]byte, bufferSize))
 }
 
 func Dial(network, address string) (net.Conn, error) {
@@ -219,11 +150,11 @@ func Dial(network, address string) (net.Conn, error) {
 	return conn, err
 }
 
-type gramListener struct {
+type packListener struct {
 	net.Listener
 }
 
-func (l *gramListener) Accept() (net.Conn, error) {
+func (l *packListener) Accept() (net.Conn, error) {
 	conn,err := l.Listener.Accept()
 	if err == nil {
 		conn = UpdateConn(conn)
@@ -232,19 +163,19 @@ func (l *gramListener) Accept() (net.Conn, error) {
 	return conn, err
 }
 
-func (l *gramListener) Close() error {
+func (l *packListener) Close() error {
 	return l.Listener.Close()
 }
 
-func (l *gramListener) Addr() net.Addr {
+func (l *packListener) Addr() net.Addr {
 	return l.Listener.Addr()
 }
 
 func updateListener(listener net .Listener) net.Listener {
-	if _,ok := listener.(*gramListener); ok {
+	if _,ok := listener.(*packListener); ok {
 		return listener
 	}
-	var l = new(gramListener)
+	var l = new(packListener)
 	l.Listener = listener
 
 	return l
@@ -261,34 +192,4 @@ func Listen(network, address string) (net.Listener, error) {
 	}
 
 	return listener, err
-}
-
-
-func readFull(reader io.Reader, buf []byte) error {
-	if buf == nil || len(buf) == 0 {
-		return nil
-	}
-	var n int
-	var err error
-	var length int
-	for {
-		n,err = reader.Read(buf[n:])
-		if err != nil {
-			return err
-		}
-		length += n
-		if length >= len(buf) {
-			break
-		}
-	}
-	if length != len(buf) {
-		return ErrUnexpectedLength
-	}
-
-	return nil
-}
-
-// ReadFull read full buf from reader.
-func ReadFull(reader io.Reader, buf []byte) error {
-	return readFull(reader, buf)
 }

@@ -2,48 +2,57 @@ package netutil
 
 import (
 	"io"
-	"fmt"
-	"time"
+		"time"
 	"bytes"
 	"unsafe"
 	"crypto/md5"
 	"encoding/binary"
-	"errors"
+		"fmt"
+	"sync"
 )
 
 const protocolMagic = 0x5F6C656E6F766F5F
 
 const protocolVersion = 1 << 24
 
-var (
-	ErrInvalidMagic   = errors.New("net util: invalid magic")
-	ErrInvalidVersion = errors.New("net util: invalid version")
-	ErrInvalidLength  = errors.New("net util: invalid length")
-	ErrInvalidMd5     = errors.New("net util: invalid md5")
+
+const (
+	errInvalidMagic = iota + 1
+	errInvalidVersion
+	errInvalidLength
+	errInvalidMd5
 )
 
-type Header interface {
-	Calc(b []byte) error
-	Verify() error
-	Length() uint64
-	Encode(writer io.Writer) error
-	Decode(reader io.Reader) error
-	Reset()
+type headerError struct {
+	code int
+	err  error
+}
+
+func (h *headerError) Error() string {
+	return h.err.Error()
+}
+
+func newHeaderError(code int, err error) error {
+	var e = new(headerError)
+	e.code = code
+	e.err = err
+
+	return e
 }
 
 type iHeader struct {
 	Magic     uint64
 	Version   uint64
 	Length    uint64
+	Timestamp int64
 }
 
 type header struct {
 	iHeader
-	Timestamp int64
 	Md5       [md5.Size]byte
 }
 
-func (h *header) calc(b []byte) error {
+func (h *header) Calc(b []byte) error {
 	h.Magic = protocolMagic
 	h.Version = protocolVersion
 	h.Length = uint64(len(b))
@@ -53,8 +62,42 @@ func (h *header) calc(b []byte) error {
 		if err := binary.Write(buffer, binary.BigEndian, h.iHeader); err != nil {
 			return err
 		}
-		var m = md5.Sum(buffer.Bytes())
-		copy(h.Md5[:], m[:])
+		h.Md5 = md5.Sum(buffer.Bytes())
+	}
+
+	return nil
+}
+
+func (h *header) Len() uint64 {
+	return h.Length
+}
+
+func (h *header) Encode(writer io.Writer) error {
+	return binary.Write(writer, binary.BigEndian, h)
+}
+
+func (h *header) Decode(reader io.Reader) error {
+	var err error
+	var buf = pool.Get().([]byte)
+	defer pool.Put(buf)
+	h.reset()
+	if _,err = io.ReadFull(reader, buf[:headerSize()]); err != nil {
+		return err
+	}
+
+	for {
+		for i := 0; i <= len(buf) - headerSize(); i++ {
+			if err = binary.Read(bytes.NewReader(buf[i:]), binary.BigEndian, h); err != nil {
+				return err
+			}
+			if err = h.verify(); err == nil {
+				return nil
+			}
+		}
+		buf = append(buf, 0)
+		if _,err = io.ReadFull(reader, buf[len(buf) - 1:]); err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -62,16 +105,14 @@ func (h *header) calc(b []byte) error {
 
 func (h *header) verify() error {
 	if h.Magic != protocolMagic {
-		return ErrInvalidMagic
-		return fmt.Errorf("invalid magic: <%02X>", h.Magic)
+		return newHeaderError(errInvalidMagic, fmt.Errorf("invalid magic: <%02X>", h.Magic))
 	}
+
 	if h.Version != protocolVersion {
-		return ErrInvalidVersion
-		return fmt.Errorf("invalid version: <%02X>", h.Version)
+		return newHeaderError(errInvalidVersion, fmt.Errorf("invalid version: <%02X>", h.Version))
 	}
 	if h.Length < 0 {
-		return ErrInvalidLength
-		return fmt.Errorf("invalid length: <%d>", h.Length)
+		return newHeaderError(errInvalidLength, fmt.Errorf("invalid length: <%d>", h.Length))
 	}
 	if h.Length > 0 {
 		var buffer = bytes.NewBuffer(make([]byte, iHeaderSize()))
@@ -81,21 +122,12 @@ func (h *header) verify() error {
 		var m = md5.Sum(buffer.Bytes())
 		for i,v := range m {
 			if v != h.Md5[i] {
-				return ErrInvalidMd5
-				return fmt.Errorf("invalid md5: <%02x>", h.Md5)
+				return newHeaderError(errInvalidMd5, fmt.Errorf("invalid md5: <%02x>", h.Md5))
 			}
 		}
 	}
 
 	return nil
-}
-
-func (h *header) encode(writer io.Writer) error {
-	return binary.Write(writer, binary.BigEndian, h)
-}
-
-func (h *header) decode(reader io.Reader) error {
-	return binary.Read(reader, binary.BigEndian, h)
 }
 
 func (h *header) reset() {
@@ -118,4 +150,10 @@ func iHeaderSize() int {
 
 func newHeader() *header {
 	return new(header)
+}
+
+var pool = sync.Pool{
+	New: func() interface{} {
+		return make([]byte, headerSize(), headerSize() * 100)
+	},
 }

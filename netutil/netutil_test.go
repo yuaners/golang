@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"time"
 	"sync"
+	"io"
 )
 
 func TestUpdateConn(t *testing.T) {
+
 	listener,err := Listen("tcp", ":9990")
 	if err != nil {
 		panic(err)
@@ -25,14 +27,19 @@ func TestUpdateConn(t *testing.T) {
 		//conn = UpdateConn(conn)
 		go func(conn net.Conn) {
 			defer wg.Done()
+			// 模拟黏包
 			time.Sleep(2 * time.Second)
 			fmt.Println("read after 2s")
 			defer conn.Close()
 			var buf = make([]byte, 1024)
-			conn.(*gramConn).conn.Read(make([]byte, 1))
+			// 模拟丢包
+			conn.(*packConn).conn.Read(make([]byte, 1))
 			for {
 				n,err := conn.Read(buf)
 				if err != nil {
+					if err == io.EOF {
+						break
+					}
 					fmt.Println("read error:", err.Error())
 					break
 				}
@@ -54,7 +61,7 @@ func TestUpdateConn(t *testing.T) {
 		if err != nil {
 			panic(err)
 		}
-		fmt.Println(i, "send len:", n)
+		fmt.Println(fmt.Sprintf("%03d send len:%d", i, n))
 	}
 
 	conn.Close()
